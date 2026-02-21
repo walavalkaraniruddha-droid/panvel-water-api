@@ -18,6 +18,8 @@ import sqlite3, pickle, os, logging, json
 import numpy as np
 import pandas as pd
 from datetime import timedelta
+import warnings
+warnings.filterwarnings("ignore")
 
 # ──────────────────────────────────────────────────────────────
 app = Flask(__name__)
