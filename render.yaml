@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: panvel-water-api
+    env: python
+    region: singapore
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app_final:app --workers 1 --timeout 120
+    envVars:
+      - key: JWT_SECRET_KEY
+        value: panvel-water-2026-viva-secret-key-strong-48chars
+      - key: PYTHON_VERSION
+        value: 3.11.0

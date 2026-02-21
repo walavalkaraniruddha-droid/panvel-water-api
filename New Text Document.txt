@@ -1,0 +1,128 @@
+from flask_cors import CORS
+from flask import Flask, jsonify
+import pickle
+import pandas as pd
+from datetime import timedelta
+from pymongo import MongoClient
+
+
+
+app = Flask(__name__)
+CORS(app)
+
+# =====================================
+# LOAD TRAINED MODELS
+# =====================================
+
+with open("supply_model.pkl", "rb") as f:
+    supply_model = pickle.load(f)
+
+with open("consumption_model.pkl", "rb") as f:
+    consumption_model = pickle.load(f)
+
+print("✅ Models Loaded Successfully")
+
+# =====================================
+# CONNECT TO MONGODB
+# =====================================
+
+client = MongoClient("mongodb://localhost:27017/")
+db = client["panvel_water_db"]
+collection = db["water_analytics"]
+
+data = list(collection.find({}, {"_id": 0}))
+df = pd.DataFrame(data)
+
+df["Date"] = pd.to_datetime(df["Date"])
+
+# =====================================
+# CONVERT TO CITY-LEVEL DAILY DATA
+# =====================================
+
+city_df = df.groupby("Date").agg({
+    "Water_Supplied_MLD": "sum",
+    "Water_Consumed_MLD": "sum"
+}).reset_index()
+
+city_df = city_df.sort_values("Date")
+
+print("✅ City-Level Data Ready")
+
+# =====================================
+# FORECAST FUNCTION (Recursive)
+# =====================================
+
+def forecast_days(dataframe, days=7):
+
+    df = dataframe.copy()
+    predictions = []
+
+    for i in range(days):
+
+        last_row = df.iloc[-1]
+        next_date = last_row["Date"] + timedelta(days=1)
+
+        # Create features
+        features_supply = pd.DataFrame([{
+            "Supply_Lag1": df.iloc[-1]["Water_Supplied_MLD"],
+            "Supply_Lag2": df.iloc[-2]["Water_Supplied_MLD"],
+            "Supply_Lag3": df.iloc[-3]["Water_Supplied_MLD"],
+            "Supply_Roll7": df["Water_Supplied_MLD"].tail(7).mean(),
+            "Month": next_date.month,
+            "DayOfWeek": next_date.dayofweek
+        }])
+
+        features_cons = pd.DataFrame([{
+            "Cons_Lag1": df.iloc[-1]["Water_Consumed_MLD"],
+            "Cons_Lag2": df.iloc[-2]["Water_Consumed_MLD"],
+            "Cons_Lag3": df.iloc[-3]["Water_Consumed_MLD"],
+            "Cons_Roll7": df["Water_Consumed_MLD"].tail(7).mean(),
+            "Month": next_date.month,
+            "DayOfWeek": next_date.dayofweek
+        }])
+
+        # Predict
+        pred_supply = float(supply_model.predict(features_supply)[0])
+        pred_cons = float(consumption_model.predict(features_cons)[0])
+        pred_leakage = pred_supply - pred_cons
+
+        predictions.append({
+            "Date": str(next_date.date()),
+            "Predicted_Supply_MLD": round(pred_supply, 3),
+            "Predicted_Consumption_MLD": round(pred_cons, 3),
+            "Predicted_Leakage_MLD": round(pred_leakage, 3)
+        })
+
+        # Append predicted row for recursive forecasting
+        new_row = {
+            "Date": next_date,
+            "Water_Supplied_MLD": pred_supply,
+            "Water_Consumed_MLD": pred_cons
+        }
+
+        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+
+    return predictions
+
+
+# =====================================
+# API ROUTES
+# =====================================
+
+@app.route("/predict/<int:days>", methods=["GET"])
+def predict(days):
+
+    if days not in [1, 7, 30]:
+        return jsonify({
+            "error": "Only 1, 7 or 30 day forecast allowed."
+        })
+
+    result = forecast_days(city_df, days)
+    return jsonify(result)
+
+
+# =====================================
+# RUN SERVER
+# =====================================
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=5000, debug=True, use_reloader=False)
