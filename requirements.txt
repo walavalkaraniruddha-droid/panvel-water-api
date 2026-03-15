@@ -1,9 +1,9 @@
-flask==3.0.0
-flask-cors==4.0.0
-flask-jwt-extended==4.6.0
-werkzeug==3.0.1
+flask==3.0.3
+flask-cors==5.0.0
+flask-jwt-extended==4.7.1
+gunicorn==23.0.0
 numpy==2.2.6
 pandas==2.2.3
 scikit-learn==1.7.2
-gunicorn==21.2.0
-setuptools==75.0.0
+openpyxl==3.1.5
+werkzeug==3.0.3
