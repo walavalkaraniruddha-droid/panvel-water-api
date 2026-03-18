@@ -19,10 +19,24 @@ app = Flask(__name__)
 app.config["JWT_SECRET_KEY"]           = os.environ.get("JWT_SECRET_KEY", "panvel-water-2026-viva-secret-key-strong")
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(days=30)
 
-CORS(app, origins="*")
+CORS(app, origins="*", supports_credentials=True, allow_headers=["Content-Type", "Authorization"], methods=["GET","POST","PUT","DELETE","OPTIONS"])
 jwt = JWTManager(app)
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
+
+def verify_token_flexible():
+    """Accept JWT from Authorization header OR ?token= query param."""
+    from flask_jwt_extended import decode_token
+    # Try query param first (for direct browser downloads)
+    token = request.args.get("token")
+    if token:
+        try:
+            decoded = decode_token(token)
+            return decoded.get("sub") or decoded.get("identity")
+        except Exception:
+            pass
+    # Fall back to header (handled by @jwt_required normally)
+    return None
 
 class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -278,9 +292,11 @@ def admin_users():
     conn.close()
     return jsonify([dict(r) for r in rows])
 
-@app.route("/admin/upload_excel", methods=["POST"])
-@jwt_required()
+@app.route("/admin/upload_excel", methods=["POST", "OPTIONS"])
+@jwt_required(optional=True)
 def upload_excel():
+    if request.method == "OPTIONS":
+        return "", 204
     err = require_admin()
     if err: return err
     email = get_jwt_identity()
@@ -357,8 +373,12 @@ def preview_file(fid):
         return jsonify({"error": str(e)}), 500
 
 @app.route("/admin/files/<int:fid>/download", methods=["GET"])
-@jwt_required()
+@jwt_required(optional=True)
 def download_file(fid):
+    from flask_jwt_extended import get_jwt_identity
+    identity = get_jwt_identity() or verify_token_flexible()
+    if not identity:
+        return jsonify({"error": "Authentication required"}), 401
     from flask import send_file
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -369,8 +389,13 @@ def download_file(fid):
     return send_file(path, as_attachment=True, download_name=row["original_name"])
 
 @app.route("/download/historical_excel")
-@jwt_required()
+@jwt_required(optional=True)
 def download_historical_excel():
+    # Accept token from header OR query param
+    from flask_jwt_extended import get_jwt_identity
+    identity = get_jwt_identity() or verify_token_flexible()
+    if not identity:
+        return jsonify({"error": "Authentication required"}), 401
     try:
         hist = CITY_BUNDLE['city_history']
         df   = pd.DataFrame(hist)
@@ -382,8 +407,12 @@ def download_historical_excel():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/download/ward_excel/<int:ward_no>")
-@jwt_required()
+@jwt_required(optional=True)
 def download_ward_excel(ward_no):
+    from flask_jwt_extended import get_jwt_identity
+    identity = get_jwt_identity() or verify_token_flexible()
+    if not identity:
+        return jsonify({"error": "Authentication required"}), 401
     try:
         rows = _ward_forecast(ward_no, 30)
         df   = pd.DataFrame(rows)
