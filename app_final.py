@@ -38,6 +38,9 @@ app.json_encoder = NumpyEncoder
 BASE    = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE, "users.db")
 
+UPLOAD_DIR = os.path.join(BASE, "uploaded_excel")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
@@ -46,7 +49,24 @@ def init_db():
             name TEXT NOT NULL,
             email TEXT NOT NULL UNIQUE,
             password TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'student',
             created DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'student'")
+    except Exception:
+        pass
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS uploaded_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT NOT NULL,
+            original_name TEXT NOT NULL,
+            uploaded_by TEXT NOT NULL,
+            rows INTEGER,
+            file_size INTEGER,
+            description TEXT,
+            uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
     conn.commit(); conn.close()
@@ -60,11 +80,11 @@ def get_user_by_email(email):
     conn.close()
     return dict(u) if u else None
 
-def create_user(name, email, password):
+def create_user(name, email, password, role="student"):
     conn = sqlite3.connect(DB_PATH)
     try:
-        conn.execute("INSERT INTO users (name,email,password) VALUES (?,?,?)",
-                     (name, email, generate_password_hash(password)))
+        conn.execute("INSERT INTO users (name,email,password,role) VALUES (?,?,?,?)",
+                     (name, email, generate_password_hash(password), role))
         conn.commit(); return True
     except sqlite3.IntegrityError: return False
     finally: conn.close()
@@ -202,23 +222,24 @@ for _wno in WARDS:
 _CACHE_WARD_30 = pd.DataFrame(_cache_ward_rows)
 log.info("✅ Cache ready")
 
-# ── AUTH ROUTES ─────────────────────────────────────────────
 @app.route("/auth/register", methods=["POST"])
 def register():
     d = request.get_json()
     name  = d.get("name","").strip()
     email = d.get("email","").strip().lower()
     pwd   = d.get("password","")
+    role  = d.get("role","student").lower()
+    if role not in ("admin","student"): role = "student"
     if not all([name, email, pwd]):
         return jsonify({"error": "All fields required"}), 400
     if len(pwd) < 6:
         return jsonify({"error": "Password must be at least 6 characters"}), 400
     if "@" not in email:
         return jsonify({"error": "Invalid email address"}), 400
-    if not create_user(name, email, pwd):
+    if not create_user(name, email, pwd, role):
         return jsonify({"error": "Email already registered"}), 409
     token = create_access_token(identity=email)
-    return jsonify({"message": "Account created!", "token": token, "name": name, "email": email}), 201
+    return jsonify({"message": "Account created!", "token": token, "name": name, "email": email, "role": role}), 201
 
 @app.route("/auth/login", methods=["POST"])
 def login():
@@ -229,19 +250,154 @@ def login():
     if not user or not check_password_hash(user["password"], pwd):
         return jsonify({"error": "Invalid email or password"}), 401
     token = create_access_token(identity=email)
-    return jsonify({"token": token, "name": user["name"], "email": email}), 200
+    return jsonify({"token": token, "name": user["name"], "email": email, "role": user.get("role","student")}), 200
 
 @app.route("/auth/me", methods=["GET"])
 @jwt_required()
 def me():
     email = get_jwt_identity()
     user  = get_user_by_email(email)
-    return jsonify({"email": email, "name": user["name"] if user else ""}), 200
+    return jsonify({"email": email, "name": user["name"] if user else "", "role": user.get("role","student") if user else "student"}), 200
+
+# ── ADMIN ROUTES ─────────────────────────────────────────────
+def require_admin():
+    email = get_jwt_identity()
+    user  = get_user_by_email(email)
+    if not user or user.get("role") != "admin":
+        return jsonify({"error": "Admin access required"}), 403
+    return None
+
+@app.route("/admin/users", methods=["GET"])
+@jwt_required()
+def admin_users():
+    err = require_admin()
+    if err: return err
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT id,name,email,role,created FROM users ORDER BY created DESC").fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+@app.route("/admin/upload_excel", methods=["POST"])
+@jwt_required()
+def upload_excel():
+    err = require_admin()
+    if err: return err
+    email = get_jwt_identity()
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+    f    = request.files["file"]
+    desc = request.form.get("description","")
+    if not f.filename:
+        return jsonify({"error": "Empty filename"}), 400
+    ext = os.path.splitext(f.filename)[1].lower()
+    if ext not in (".xlsx",".xls",".csv"):
+        return jsonify({"error": "Only .xlsx/.xls/.csv allowed"}), 400
+    import uuid
+    safe_name = f"{uuid.uuid4().hex}{ext}"
+    path = os.path.join(UPLOAD_DIR, safe_name)
+    f.save(path)
+    size = os.path.getsize(path)
+    if size > 50 * 1024 * 1024:
+        os.remove(path)
+        return jsonify({"error": "File too large (max 50 MB)"}), 400
+    try:
+        df = pd.read_csv(path) if ext == ".csv" else pd.read_excel(path)
+        rows = len(df)
+        cols = list(df.columns)
+    except Exception as e:
+        os.remove(path)
+        return jsonify({"error": f"Could not read file: {e}"}), 400
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("INSERT INTO uploaded_files (filename,original_name,uploaded_by,rows,file_size,description) VALUES (?,?,?,?,?,?)",
+                 (safe_name, f.filename, email, rows, size, desc))
+    conn.commit(); conn.close()
+    return jsonify({"message": "Uploaded", "rows": rows, "columns": cols}), 201
+
+@app.route("/admin/files", methods=["GET"])
+@jwt_required()
+def list_files():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT * FROM uploaded_files ORDER BY uploaded_at DESC").fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+@app.route("/admin/files/<int:fid>", methods=["DELETE"])
+@jwt_required()
+def delete_file(fid):
+    err = require_admin()
+    if err: return err
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM uploaded_files WHERE id=?", (fid,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"error": "File not found"}), 404
+    path = os.path.join(UPLOAD_DIR, row["filename"])
+    if os.path.exists(path): os.remove(path)
+    conn.execute("DELETE FROM uploaded_files WHERE id=?", (fid,))
+    conn.commit(); conn.close()
+    return jsonify({"message": "Deleted"})
+
+@app.route("/admin/files/<int:fid>/preview", methods=["GET"])
+@jwt_required()
+def preview_file(fid):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM uploaded_files WHERE id=?", (fid,)).fetchone()
+    conn.close()
+    if not row: return jsonify({"error": "File not found"}), 404
+    path = os.path.join(UPLOAD_DIR, row["filename"])
+    ext  = os.path.splitext(row["filename"])[1].lower()
+    try:
+        df = pd.read_csv(path) if ext == ".csv" else pd.read_excel(path)
+        return jsonify(df.head(50).to_dict(orient="records"))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/admin/files/<int:fid>/download", methods=["GET"])
+@jwt_required()
+def download_file(fid):
+    from flask import send_file
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM uploaded_files WHERE id=?", (fid,)).fetchone()
+    conn.close()
+    if not row: return jsonify({"error": "File not found"}), 404
+    path = os.path.join(UPLOAD_DIR, row["filename"])
+    return send_file(path, as_attachment=True, download_name=row["original_name"])
+
+@app.route("/download/historical_excel")
+@jwt_required()
+def download_historical_excel():
+    try:
+        hist = CITY_BUNDLE['city_history']
+        df   = pd.DataFrame(hist)
+        path = os.path.join(BASE, "_city_historical.xlsx")
+        df.to_excel(path, index=False)
+        from flask import send_file
+        return send_file(path, as_attachment=True, download_name="City_Historical_Data.xlsx")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/download/ward_excel/<int:ward_no>")
+@jwt_required()
+def download_ward_excel(ward_no):
+    try:
+        rows = _ward_forecast(ward_no, 30)
+        df   = pd.DataFrame(rows)
+        path = os.path.join(BASE, f"_ward_{ward_no}.xlsx")
+        df.to_excel(path, index=False)
+        from flask import send_file
+        return send_file(path, as_attachment=True, download_name=f"Zone_{ward_no}_Forecast.xlsx")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ── DATA ROUTES ─────────────────────────────────────────────
 @app.route("/")
 def index():
-    return jsonify({"status": "Panvel Water Analytics API v2", "zones": len(WARDS), "target_mld": 211})
+    return jsonify({"status": "Water Management Analytics API v3", "zones": len(WARDS), "target_mld": 211})
 
 @app.route("/summary")
 @jwt_required()
