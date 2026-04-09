@@ -556,6 +556,14 @@ def all_wards_on_date(date_str):
 def not_found(e):
     return jsonify({"error": "Route not found"}), 404
 
+@app.route("/debug/users")
+def debug_users():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT id, name, email, role, created FROM users").fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
