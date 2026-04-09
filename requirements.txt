@@ -2,7 +2,8 @@ flask==3.0.3
 flask-cors==4.0.0
 flask-jwt-extended==4.7.1
 gunicorn==23.0.0
-numpy==2.2.6
+numpy==2.2.0
 pandas==2.2.3
-scikit-learn==1.7.2
+scikit-learn==1.8.0
 openpyxl==3.1.5
+werkzeug==3.1.3
